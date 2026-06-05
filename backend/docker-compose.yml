@@ -1,0 +1,196 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: omnitrust_postgres
+    environment:
+      POSTGRES_USER: omniadmin
+      POSTGRES_PASSWORD: securepassword
+      POSTGRES_DB: omnitrust_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omniadmin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - omnitrust_network
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: omnitrust_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - omnitrust_network
+
+  # MinIO (Object Storage)
+  minio:
+    image: minio/minio:latest
+    container_name: omnitrust_minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - omnitrust_network
+
+  # Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: omnitrust_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ELASTIC_PASSWORD=securepassword
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - omnitrust_network
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: omnitrust_prometheus
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    networks:
+      - omnitrust_network
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: omnitrust_grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - omnitrust_network
+
+  # FastAPI Application
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: omnitrust_app
+    environment:
+      DATABASE_URL: postgresql://omniadmin:securepassword@postgres:5432/omnitrust_db
+      REDIS_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      REDIS_CELERY_URL: redis://redis:6379/2
+      SECRET_KEY: your-super-secret-key-change-in-production
+      MINIO_ENDPOINT: minio:9000
+      ELASTICSEARCH_HOST: elasticsearch
+      ELASTICSEARCH_PORT: 9200
+      DEBUG: "false"
+      ENVIRONMENT: production
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    networks:
+      - omnitrust_network
+    command: >
+      sh -c "python -m alembic upgrade head &&
+             python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # Celery Worker
+  celery_worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: omnitrust_celery_worker
+    environment:
+      DATABASE_URL: postgresql://omniadmin:securepassword@postgres:5432/omnitrust_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./:/app
+    networks:
+      - omnitrust_network
+    command: python -m celery -A app.workers.celery_app worker --loglevel=info
+
+  # Celery Beat (Scheduler)
+  celery_beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: omnitrust_celery_beat
+    environment:
+      DATABASE_URL: postgresql://omniadmin:securepassword@postgres:5432/omnitrust_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./:/app
+    networks:
+      - omnitrust_network
+    command: python -m celery -A app.workers.celery_app beat --loglevel=info
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  elasticsearch_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  omnitrust_network:
+    driver: bridge
